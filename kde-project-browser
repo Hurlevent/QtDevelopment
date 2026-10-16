@@ -1,0 +1,1800 @@
+#!/usr/bin/env python3
+"""
+KDE Project Browser
+Browse all active KDE projects from local repo-metadata.
+No external dependencies required.
+
+Usage: kde-project-browser [metadata-dir]
+Default metadata dir: ~/.local/state/sysadmin-repo-metadata/projects-invent
+"""
+
+import curses
+import json
+import os
+import re
+import subprocess
+import sys
+import threading
+import urllib.request
+from pathlib import Path
+
+
+METADATA_DIR      = Path.home() / ".local/state/sysadmin-repo-metadata/projects-invent"
+REPO_ROOT         = Path.home() / ".local/state/sysadmin-repo-metadata"
+DEP_FILE          = REPO_ROOT / "kde-dependencies" / "kde-dependencies-latest-kf6"
+ARCH_DEP_FILE     = REPO_ROOT / "distro-dependencies" / "arch.yaml"
+SCRIPT_DIR        = Path(__file__).resolve().parent
+QT6_DIR           = SCRIPT_DIR / "qt6"
+KDE_BUILDER_CONF  = Path.home() / ".config" / "kde-builder.yaml"
+
+HELP = (
+    " Type:search  ↑↓:move  PgUp/PgDn:page  "
+    "Home/End  Tab:category  →:commands  Enter:select  Esc:quit"
+)
+
+COMMANDS = [
+    ("Change Qt version",      "Switch kde-builder to use a different Qt worktree's build"),
+    ("Fix Qt build",           "Add missing Qt submodules to the active worktree and rebuild"),
+    ("Build with kde-builder", "Build this KDE project with kde-builder"),
+    ("Add to workspace",       "Add this project to the active Qt worktree's VS Code workspace"),
+    ("Remove from workspace",  "Remove this project from the active Qt worktree's workspace"),
+    ("Run application",        "Launch the built executable directly or inside a Wayland session"),
+]
+
+_INVENT_BASE = "https://invent.kde.org"
+
+# Patterns for the Qt minimum version in CMakeLists.txt, in preference order.
+# KDE projects use QT_MIN_VERSION or REQUIRED_QT_VERSION; fall back to a
+# literal version in find_package(Qt6 ...).
+_QT_VER_PATTERNS = [
+    re.compile(r'set\s*\(\s*(?:QT_MIN_VERSION|REQUIRED_QT_VERSION)\s+"(\d+\.\d+(?:\.\d+)?)"',  re.IGNORECASE),
+    re.compile(r"set\s*\(\s*(?:QT_MIN_VERSION|REQUIRED_QT_VERSION)\s+'(\d+\.\d+(?:\.\d+)?)'",   re.IGNORECASE),
+    re.compile(r'set\s*\(\s*(?:QT_MIN_VERSION|REQUIRED_QT_VERSION)\s+(\d+\.\d+(?:\.\d+)?)\s*\)', re.IGNORECASE),
+    re.compile(r'find_package\s*\(\s*Qt6\s+(\d+\.\d+(?:\.\d+)?)'),
+]
+
+_SENTINEL = object()  # marks "not yet fetched" in _qt_ver_cache
+
+# ident → version string (e.g. "6.6.0"), None if not found/failed, _SENTINEL if not fetched
+_qt_ver_cache: dict = {}
+_qt_ver_fetching: set[str] = set()
+_qt_ver_lock = threading.Lock()
+
+
+def _extract_qt_min_version(text: str) -> str | None:
+    for pat in _QT_VER_PATTERNS:
+        m = pat.search(text)
+        if m:
+            return m.group(1)
+    return None
+
+
+# CMake Qt6 component name (lowercase) → arch qt6-* package name.
+# Components that map to qtbase are omitted — qtbase is already universal.
+_QT6_COMPONENT_TO_PKG: dict[str, str] = {
+    # qtdeclarative
+    **dict.fromkeys(
+        ["qml", "qmlcore", "qmlmodels", "qmlworkerscript", "qmlxmllistmodel",
+         "quick", "quickcontrols2", "quickcontrols2impl", "quickdialogs2",
+         "quickdialogs2quickimpl", "quickdialogs2utils", "quicklayouts",
+         "quickparticles", "quickshapes", "quicktemplates2", "quicktest",
+         "quickwidgets", "labsanimation", "labsfolderlistmodel",
+         "labsplatform", "labssettings", "labswavefrontmesh"],
+        "qt6-declarative",
+    ),
+    # qtshadertools
+    **dict.fromkeys(["shadertools"], "qt6-shadertools"),
+    # qtsvg
+    **dict.fromkeys(["svg", "svgwidgets"], "qt6-svg"),
+    # qtmultimedia
+    **dict.fromkeys(
+        ["multimedia", "multimediawidgets", "multimediaquick", "spatialaudio"],
+        "qt6-multimedia",
+    ),
+    # qtwebengine  (PDF modules are part of WebEngine)
+    **dict.fromkeys(
+        ["webenginecore", "webenginewidgets", "webenginequick", "pdf", "pdfwidgets"],
+        "qt6-webengine",
+    ),
+    # qtwebsockets
+    **dict.fromkeys(["websockets"], "qt6-websockets"),
+    # qtwebview
+    **dict.fromkeys(["webview"], "qt6-webview"),
+    # qtcharts
+    **dict.fromkeys(["charts"], "qt6-charts"),
+    # qtdatavis3d
+    **dict.fromkeys(["datavisualization"], "qt6-datavis3d"),
+    # qt3d
+    **dict.fromkeys(
+        ["3dcore", "3drender", "3dinput", "3dlogic", "3danimation",
+         "3dextras", "3dquick", "3dquickrender", "3dquickextras",
+         "3dquickinput", "3dquickscene2d"],
+        "qt6-3d",
+    ),
+    # qtgraphs
+    **dict.fromkeys(["graphs", "graphswidgets"], "qt6-graphs"),
+    # qtlocation
+    **dict.fromkeys(["location"], "qt6-location"),
+    # qtpositioning
+    **dict.fromkeys(["positioning", "positioningquick"], "qt6-positioning"),
+    # qtsensors
+    **dict.fromkeys(["sensors", "sensorsquick"], "qt6-sensors"),
+    # qtconnectivity
+    **dict.fromkeys(["bluetooth", "nfc"], "qt6-connectivity"),
+    # qtnetworkauth
+    **dict.fromkeys(["networkauth"], "qt6-networkauth"),
+    # qthttpserver
+    **dict.fromkeys(["httpserver"], "qt6-httpserver"),
+    # qtserialport
+    **dict.fromkeys(["serialport"], "qt6-serialport"),
+    # qtserialbus
+    **dict.fromkeys(["serialbus", "canbusreply"], "qt6-serialbus"),
+    # qtvirtualkeyboard
+    **dict.fromkeys(["virtualkeyboard"], "qt6-virtualkeyboard"),
+    # qtspeech
+    **dict.fromkeys(["texttospeech"], "qt6-speech"),
+    # qtwayland
+    **dict.fromkeys(["waylandclient", "waylandcompositor"], "qt6-wayland"),
+    # qt5compat
+    **dict.fromkeys(["core5compat"], "qt6-5compat"),
+    # qtscxml
+    **dict.fromkeys(["scxml", "statemachinetestutils"], "qt6-scxml"),
+    # qtstatemachine
+    **dict.fromkeys(["statemachine"], "qt6-statemachine"),
+    # qtquick3d
+    **dict.fromkeys(
+        ["quick3d", "quick3dcore", "quick3dhelpers", "quick3diblbaker",
+         "quick3dphysics", "quick3dparticles", "quick3dparticlesutils",
+         "quick3dspatialaudio", "quick3dxr"],
+        "qt6-quick3d",
+    ),
+    # qttools  (UiTools / LinguistTools / Help are build-time tools)
+    **dict.fromkeys(["uitools", "linguisttools", "help", "designercomponents"], "qt6-tools"),
+    # qtimageformats — no direct CMake component; included via plugin loading
+    # qtlottie
+    **dict.fromkeys(["bodymovin"], "qt6-lottie"),
+    # qtremoteobjects
+    **dict.fromkeys(["remoteobjects"], "qt6-remoteobjects"),
+    # qtcoap
+    **dict.fromkeys(["coap"], "qt6-coap"),
+    # qtmqtt
+    **dict.fromkeys(["mqtt"], "qt6-mqtt"),
+    # qtopcua
+    **dict.fromkeys(["opcua"], "qt6-opcua"),
+    # qtgrpc
+    **dict.fromkeys(["grpc", "protobuf", "protobufquick", "protobufwellknowntypes"], "qt6-grpc"),
+    # qtlanguageserver
+    **dict.fromkeys(["languageserver"], "qt6-languageserver"),
+}
+
+# CMake keywords that are never Qt component names
+_CMAKE_KW = frozenset([
+    "required", "components", "optional_components", "config", "no_module",
+    "quiet", "exact", "no_policy_scope", "hints", "paths", "path_suffixes",
+    "no_default_path", "no_cmake_path", "no_cmake_environment_path",
+    "no_system_environment_path", "no_cmake_system_path", "registry_view",
+    "bypass_provider", "cmake_find_root_path_both", "only_cmake_find_root_path",
+    "no_cmake_find_root_path", "global",
+])
+
+
+def _extract_cmake_qt_pkgs(cmake_text: str) -> set[str]:
+    """Return qt6-* package names inferred from find_package(Qt6 ...) component lists."""
+    pkgs: set[str] = set()
+    for m in re.finditer(
+        r'find_package\s*\(\s*Qt6\b([^)]*)\)', cmake_text, re.DOTALL
+    ):
+        args = re.sub(r'\$\{[^}]+\}', '', m.group(1))   # strip ${VAR}
+        args = re.sub(r'"[^"]*"', '', args)              # strip quoted strings
+        for tok in args.split():
+            lower = tok.lower()
+            if lower in _CMAKE_KW:
+                continue
+            if re.match(r'^\d', tok):                    # skip version numbers
+                continue
+            pkg = _QT6_COMPONENT_TO_PKG.get(lower)
+            if pkg:
+                pkgs.add(pkg)
+    return pkgs
+
+
+# ident → set of qt6-* packages extracted from CMakeLists.txt
+_qt_cmake_deps_cache: dict[str, set[str]] = {}
+
+
+def _fetch_qt_min_version(ident: str, repopath: str) -> None:
+    """Background thread: fetch CMakeLists.txt and cache both the Qt min version
+    and any Qt module packages inferred from find_package(Qt6 COMPONENTS ...).
+    """
+    version = None
+    cmake_pkgs: set[str] = set()
+    for branch in ("master", "main", "kf6"):
+        url = f"{_INVENT_BASE}/{repopath}/-/raw/{branch}/CMakeLists.txt"
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "kde-project-browser"})
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                if resp.status == 200:
+                    text = resp.read(32768).decode("utf-8", errors="replace")
+                    version    = _extract_qt_min_version(text)
+                    cmake_pkgs = _extract_cmake_qt_pkgs(text)
+                    break
+        except Exception:
+            continue
+    with _qt_ver_lock:
+        _qt_ver_cache[ident]        = version
+        _qt_cmake_deps_cache[ident] = cmake_pkgs
+        _qt_ver_fetching.discard(ident)
+
+
+def schedule_qt_ver_fetch(ident: str, repopath: str) -> None:
+    with _qt_ver_lock:
+        if ident in _qt_ver_cache or ident in _qt_ver_fetching:
+            return
+        _qt_ver_fetching.add(ident)
+    threading.Thread(
+        target=_fetch_qt_min_version, args=(ident, repopath), daemon=True
+    ).start()
+
+
+def parse_branch_version(branch: str) -> tuple[int, ...] | None:
+    """Return (major, minor[, patch]) for a version branch like '6.8', else None."""
+    m = re.fullmatch(r"(\d+)\.(\d+)(?:\.(\d+))?", branch)
+    if m:
+        return tuple(int(x) for x in m.groups() if x is not None)
+    return None  # 'dev' or non-version branches always satisfy any requirement
+
+
+# ── kde-builder local status ──────────────────────────────────────────────────
+
+def load_kde_builder_dirs() -> dict:
+    """Parse kde-builder.yaml and return {source, build, log} Path objects."""
+    try:
+        import yaml
+        with open(KDE_BUILDER_CONF, encoding="utf-8") as f:
+            cfg = yaml.safe_load(f)
+        g = cfg.get("global", {})
+        def get(key):
+            v = g.get(key) or g.get(key.replace("-", "_"))
+            return Path(v).expanduser() if v else None
+        src        = get("source-dir")
+        bld        = get("build-dir")
+        log        = get("log-dir")
+        qt_install = get("qt-install-dir")
+        if src and bld:
+            return {"source": src, "build": bld, "log": log, "qt_install": qt_install}
+    except Exception:
+        pass
+    return {}
+
+
+KDE_CLANGD_HEADER = (
+    "# Auto-generated by kde-project-browser after a successful kde-builder run.\n"
+    "# Do not edit by hand \u2014 regenerated on every successful build.\n"
+    "# One entry per project under the build dir that has a compile_commands.json.\n"
+)
+
+
+def regen_kde_clangd(dirs: dict) -> tuple[Path | None, int, str]:
+    """Write a .clangd next to kde-builder's src/ and build/ dirs.
+
+    Maps each built project's sources onto its compile_commands.json so clangd
+    resolves headers for anything under the kde-builder source tree.
+    Returns (path_written, entry_count, message).
+    """
+    src_root = dirs.get("source")
+    bld_root = dirs.get("build")
+    if not src_root or not bld_root:
+        return None, 0, "kde-builder source/build dirs unknown \u2014 skipped .clangd"
+
+    # Entries use paths relative to the .clangd, so both trees must share a parent.
+    root = src_root.parent
+    if bld_root.parent != root:
+        return None, 0, (f"src ({src_root}) and build ({bld_root}) do not share a "
+                         "parent \u2014 skipped .clangd")
+    if not root.is_dir():
+        return None, 0, f"{root} does not exist \u2014 skipped .clangd"
+
+    src_rel = src_root.name
+    bld_rel = bld_root.name
+
+    entries = []
+    for cc in sorted(bld_root.glob("*/compile_commands.json")):
+        ident = cc.parent.name
+        if not (src_root / ident).is_dir():
+            continue
+        entries.append(
+            "---\n"
+            f"If:\n"
+            f"  PathMatch: {src_rel}/{ident.replace('.', chr(92) + '.')}/.*\n"
+            f"CompileFlags:\n"
+            f"  CompilationDatabase: {bld_rel}/{ident}\n\n"
+        )
+
+    if not entries:
+        return None, 0, f"no compile_commands.json under {bld_root} \u2014 skipped .clangd"
+
+    out = root / ".clangd"
+    if out.exists() and not out.read_text(encoding="utf-8").startswith("# Auto-generated by kde-project-browser"):
+        return None, 0, f"{out} exists and was not generated by us \u2014 left untouched"
+
+    tmp = out.with_suffix(".clangd.tmp")
+    tmp.write_text(KDE_CLANGD_HEADER + "\n" + "".join(entries), encoding="utf-8")
+    tmp.replace(out)
+    return out, len(entries), f"{out}: {len(entries)} project(s)"
+
+
+# ident → local status dict (or None while fetching)
+_kde_local_cache: dict[str, dict] = {}
+_kde_local_fetching: set[str] = set()
+
+
+def _fetch_kde_local_status(ident: str, src: Path, bld: Path, log_dir: Path | None) -> None:
+    """Background thread: git status + build state for a kde-builder project."""
+    import datetime
+    result: dict = {}
+
+    # ── source dir ───────────────────────────────────────────────────────────
+    result["src_exists"] = src.exists()
+    if src.exists():
+        def git(*args):
+            return subprocess.run(
+                ["git", "-C", str(src)] + list(args),
+                capture_output=True, text=True, timeout=5,
+            ).stdout.strip()
+        result["branch"] = git("branch", "--show-current") or "detached"
+        lines = git("status", "--porcelain").splitlines()
+        modified  = sum(1 for l in lines if l and not l.startswith("?"))
+        untracked = sum(1 for l in lines if l.startswith("?"))
+        if not lines:
+            result["git_clean"]   = True
+            result["git_summary"] = "clean"
+        else:
+            result["git_clean"] = False
+            parts = []
+            if modified:  parts.append(f"{modified} modified")
+            if untracked: parts.append(f"{untracked} untracked")
+            result["git_summary"] = ", ".join(parts)
+
+    # ── build dir ────────────────────────────────────────────────────────────
+    result["bld_exists"] = bld.exists()
+    if bld.exists():
+        cmake_cache = bld / "CMakeCache.txt"
+        result["configured"] = cmake_cache.exists()
+        if cmake_cache.exists():
+            result["configured_at"] = datetime.datetime.fromtimestamp(
+                cmake_cache.stat().st_mtime
+            ).strftime("%Y-%m-%d")
+
+        # Last build outcome from kde-builder's log
+        result["build_success"] = None
+        if log_dir:
+            log_file = log_dir / "latest" / ident / "build.log"
+            if log_file.exists():
+                try:
+                    with open(log_file, "rb") as f:
+                        f.seek(max(0, f.seek(0, 2) or 0) - 512)
+                        tail = f.read().decode("utf-8", errors="replace")
+                    for line in reversed(tail.splitlines()):
+                        if "exit code was:" in line:
+                            result["build_success"] = line.strip().endswith(": 0")
+                            break
+                except Exception:
+                    pass
+
+        result["installed"] = (bld / "install_manifest.txt").exists()
+
+    with _qt_ver_lock:
+        _kde_local_cache[ident] = result
+        _kde_local_fetching.discard(ident)
+
+
+def schedule_kde_local_fetch(ident: str, src: Path, bld: Path, log_dir: Path | None) -> None:
+    with _qt_ver_lock:
+        if ident in _kde_local_cache or ident in _kde_local_fetching:
+            return
+        _kde_local_fetching.add(ident)
+    threading.Thread(
+        target=_fetch_kde_local_status, args=(ident, src, bld, log_dir), daemon=True
+    ).start()
+
+
+# ── data loading ──────────────────────────────────────────────────────────────
+
+def parse_metadata(path: Path) -> dict:
+    data = {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.rstrip()
+                if not line or line.startswith(" ") or line.startswith("-"):
+                    continue
+                if ": " in line:
+                    key, _, value = line.partition(": ")
+                    data[key.strip()] = value.strip()
+                elif line.endswith(":"):
+                    data[line[:-1].strip()] = ""
+    except OSError:
+        pass
+    return data
+
+
+def load_projects(metadata_dir: Path) -> list[dict]:
+    projects = []
+    for meta_file in sorted(metadata_dir.rglob("metadata.yaml")):
+        data = parse_metadata(meta_file)
+        if data.get("repoactive", "").lower() != "true":
+            continue
+        rel = meta_file.relative_to(metadata_dir)
+        data["_category"] = rel.parts[0] if len(rel.parts) > 2 else "other"
+        projects.append(data)
+    return sorted(projects, key=lambda p: p.get("identifier", "").lower())
+
+
+def load_dependencies(dep_file: Path) -> tuple[dict, dict]:
+    """Parse dep file → (forward, reverse) where each is {repopath: [repopath, ...]}."""
+    forward: dict[str, list[str]] = {}
+    reverse: dict[str, list[str]] = {}
+    if not dep_file.exists():
+        return forward, reverse
+    try:
+        with open(dep_file, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if ": " in line:
+                    proj, _, dep = line.partition(": ")
+                    proj, dep = proj.strip(), dep.strip()
+                    forward.setdefault(proj, []).append(dep)
+                    reverse.setdefault(dep, []).append(proj)
+    except OSError:
+        pass
+    return forward, reverse
+
+
+def load_qt_deps(arch_yaml: Path) -> dict[str, list[str]]:
+    """Parse arch.yaml → {identifier: [qt6-module, ...]} including common deps.
+
+    Reads both 'depends' and 'makedepends' (build-time tools like qt6-tools
+    and qt6-shadertools matter for building KDE projects).  qt6-doc is excluded
+    — it is only for generating API documentation, not for building.
+    qt6-base is included because it comes from the 'common' section and is an
+    unconditional requirement for every project.
+    """
+    result: dict[str, list[str]] = {}
+    try:
+        import yaml
+        with open(arch_yaml, encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+    except Exception:
+        return result
+
+    skip = {"qt6-doc"}
+
+    # qt6-base lives in 'common' and applies to every project
+    common_qt = sorted(
+        d for d in (data.get("common") or [])
+        if isinstance(d, str) and d.startswith("qt6-") and d not in skip
+    )
+
+    for ident, info in (data.get("projects") or {}).items():
+        all_deps = list(info.get("depends") or []) + list(info.get("makedepends") or [])
+        qt_mods = sorted({
+            d for d in all_deps
+            if isinstance(d, str) and d.startswith("qt6-") and d not in skip
+        } | set(common_qt))
+        if qt_mods:
+            result[ident] = qt_mods
+    return result
+
+
+def arch_pkg_to_submodule(pkg: str) -> str:
+    """Convert an Arch qt6 package name to a Qt submodule directory name.
+
+    qt6-svg → qtsvg,  qt6-5compat → qt5compat,  qt6-quick3d → qtquick3d
+    """
+    if pkg.startswith("qt6-"):
+        return "qt" + pkg[4:].replace("-", "")
+    return pkg
+
+
+def collect_qt_deps_transitive(
+    ident: str,
+    qt_deps: dict,
+    forward_deps: dict,
+    repopath_to_ident: dict,
+    ident_to_repopath: dict,
+    visited: set | None = None,
+) -> set[str]:
+    """Return all qt6-* packages required by ident, tracing through KDE deps recursively."""
+    if visited is None:
+        visited = set()
+    if ident in visited:
+        return set()
+    visited.add(ident)
+    result = set(qt_deps.get(ident, []))
+    repopath = ident_to_repopath.get(ident, "")
+    for dep_rp in forward_deps.get(repopath, []):
+        dep_ident = repopath_to_ident.get(dep_rp, "")
+        if dep_ident:
+            result |= collect_qt_deps_transitive(
+                dep_ident, qt_deps, forward_deps,
+                repopath_to_ident, ident_to_repopath, visited,
+            )
+    return result
+
+
+def load_worktrees(qt6_dir: Path) -> dict:
+    """Return initialized-submodule sets for every please.sh worktree, plus known modules.
+
+    Returns {"worktrees": [{"branch": str, "path": Path, "modules": set[str]}],
+             "known": set[str]}
+    """
+    empty = {"worktrees": [], "known": set()}
+    if not qt6_dir.exists():
+        return empty
+
+    def git(*args, cwd=qt6_dir, timeout=15):
+        try:
+            r = subprocess.run(
+                ["git", "-C", str(cwd)] + list(args),
+                capture_output=True, text=True, timeout=timeout,
+            )
+            return r.stdout
+        except Exception:
+            return ""
+
+    # All submodule names from .gitmodules (fast, no network)
+    raw = git("config", "--file", ".gitmodules", "--get-regexp", r"submodule\..*\.path")
+    known = {line.split()[-1] for line in raw.splitlines() if line.strip()}
+
+    # Parse worktree list
+    worktrees = []
+    current: dict = {}
+    for line in git("worktree", "list", "--porcelain").splitlines():
+        if line.startswith("worktree "):
+            if current:
+                worktrees.append(current)
+            current = {"path": Path(line[9:]), "branch": None}
+        elif line.startswith("branch "):
+            ref = line[7:]
+            current["branch"] = ref.removeprefix("refs/heads/")
+        elif not line and current:
+            worktrees.append(current)
+            current = {}
+    if current:
+        worktrees.append(current)
+
+    result = []
+    for wt in worktrees:
+        branch = wt.get("branch")
+        path   = wt.get("path", Path())
+        if not branch or not path.exists():
+            continue
+        # Get initialized submodule names for this worktree
+        raw_sm = git("submodule", "status", cwd=path)
+        modules = set()
+        for sm_line in raw_sm.splitlines():
+            if sm_line and not sm_line.startswith("-"):
+                parts = sm_line.strip().split()
+                if len(parts) >= 2:
+                    modules.add(parts[1])
+        result.append({"branch": branch, "path": path, "modules": modules})
+
+    return {"worktrees": result, "known": known}
+
+
+def clip(text: str) -> None:
+    for cmd in ("xclip -selection clipboard", "xsel --clipboard --input", "wl-copy"):
+        if os.system(f"echo -n {text!r} | {cmd} 2>/dev/null") == 0:
+            return
+
+
+def find_wayland_sessions() -> list[str]:
+    """Return names of active Wayland sockets in /run/user/<uid>/."""
+    import stat
+    uid = os.getuid()
+    runtime_dir = Path(f"/run/user/{uid}")
+    if not runtime_dir.exists():
+        return []
+    sessions = []
+    try:
+        for p in sorted(runtime_dir.iterdir()):
+            if not p.name.startswith("wayland") or p.name.endswith(".lock"):
+                continue
+            try:
+                if stat.S_ISSOCK(p.stat().st_mode):
+                    sessions.append(p.name)
+            except OSError:
+                pass
+    except OSError:
+        pass
+    return sessions
+
+
+def _workspace_path(branch: str) -> Path:
+    """Replicate please.sh branch_to_workspace_file() in Python."""
+    name = branch.replace(".", "").replace("/", "").replace("-", "")
+    return SCRIPT_DIR / f"Qt{name}.code-workspace"
+
+
+# ── TUI ──────────────────────────────────────────────────────────────────────
+
+def run(stdscr, projects: list[dict], forward_deps: dict, reverse_deps: dict,
+        repopath_to_ident: dict, ident_to_repopath: dict, qt_deps: dict,
+        worktree_info: dict, kde_builder_dirs: dict):
+    curses.curs_set(0)
+    curses.use_default_colors()
+    stdscr.timeout(250)  # non-blocking getch for async Qt-version updates
+    curses.init_pair(1, curses.COLOR_CYAN,    -1)
+    curses.init_pair(2, curses.COLOR_GREEN,   -1)
+    curses.init_pair(3, curses.COLOR_YELLOW,  -1)
+    curses.init_pair(4, curses.COLOR_WHITE,   -1)
+    curses.init_pair(5, curses.COLOR_BLUE,    -1)
+    curses.init_pair(6, curses.COLOR_BLACK,   curses.COLOR_WHITE)
+    curses.init_pair(7, curses.COLOR_MAGENTA, -1)
+
+    C_HEAD = curses.color_pair(1)
+    C_SEL  = curses.color_pair(2) | curses.A_BOLD | curses.A_REVERSE
+    C_HI   = curses.color_pair(3)
+    C_NORM = curses.color_pair(4)
+    C_CAT  = curses.color_pair(5)
+    C_SBAR = curses.color_pair(6)
+
+    LIFECYCLE_COLOR = {
+        "active":       curses.color_pair(2),
+        "reviewed":     curses.color_pair(4),
+        "playground":   curses.color_pair(3),
+        "in-review":    curses.color_pair(3),
+        "unmaintained": curses.color_pair(7),
+        "archived":     curses.color_pair(7),
+    }
+
+    categories = ["(all)"] + sorted({p["_category"] for p in projects})
+
+    search    = ""
+    cat_idx   = 0
+    selected  = 0
+    scroll    = 0
+    filtered: list[dict] = []
+    status_msg = ""
+
+    # command panel state
+    panel            = "list"   # "list" | "commands" | "wt_select" | "run_mode_select" | "cmd_result"
+    cmd_idx          = 0
+    wt_idx           = 0
+    pending_cmd      = 0        # which COMMANDS index triggered wt_select
+    cmd_result_lines: list[str] = []
+    cmd_result_ok    = True
+    run_mode_idx     = 0
+    run_mode_options: list[str] = []
+    pending_exe      = ""
+
+    def refilter():
+        nonlocal filtered, selected, scroll
+        q   = search.lower()
+        cat = categories[cat_idx]
+        result = projects
+        if cat != "(all)":
+            result = [p for p in result if p["_category"] == cat]
+        if q:
+            result = [
+                p for p in result
+                if q in p.get("identifier",  "").lower()
+                or q in p.get("name",        "").lower()
+                or q in p.get("description", "").lower()
+                or q in p.get("repopath",    "").lower()
+            ]
+        filtered = result
+        selected = 0
+        scroll   = 0
+
+    refilter()
+
+    def _do_fix_qt_build(project, worktree):
+        """Return (result_lines, action) — one is always None."""
+        p_ident = project.get("identifier", "")
+        with _qt_ver_lock:
+            cmake_pkgs = _qt_cmake_deps_cache.get(p_ident)
+        eff = {**qt_deps, p_ident: sorted(cmake_pkgs | {"qt6-base"})} \
+              if cmake_pkgs is not None else qt_deps
+        all_qt = collect_qt_deps_transitive(
+            p_ident, eff, forward_deps, repopath_to_ident, ident_to_repopath
+        )
+        known_mods = worktree_info.get("known", set())
+        required   = {arch_pkg_to_submodule(m) for m in all_qt} & known_mods if all_qt else set()
+        branch     = worktree["branch"]
+        build_base = SCRIPT_DIR / f"{branch}-build"
+        missing_src = sorted(required - worktree["modules"])
+        if missing_src:
+            return None, {"action": "please-create", "worktree": branch, "modules": missing_src}
+        qmake        = build_base / "qtbase" / "bin" / "qmake"
+        missing_bld  = [m for m in required if not (build_base / m).exists()]
+        if not qmake.exists() or missing_bld:
+            reserve = max(1, (os.cpu_count() or 2) // 2)
+            return None, {"action": "please-build", "worktree": branch, "reserve": reserve}
+        n = len(required)
+        return [f"✓ All {n} required Qt module(s) are",
+                f"  present and built in '{branch}'."], None
+
+    def _do_kde_builder(project):
+        """Return (result_lines, action) — one is always None."""
+        p_ident = project.get("identifier", "")
+        if not kde_builder_dirs:
+            return ["kde-builder is not configured.",
+                    "Run: ./please.sh kde-hijack <worktree>"], None
+        qt_install = kde_builder_dirs.get("qt_install")
+        if qt_install and not (qt_install / "bin" / "qmake").exists():
+            return ["Qt build is broken!",
+                    f"  {qt_install}",
+                    "Fix: ./please.sh build <worktree>",
+                    "Then: ./please.sh kde-hijack <worktree>"], None
+        return None, {"action": "kde-builder", "identifier": p_ident}
+
+    def _find_exe(project):
+        """Validate build and locate the project executable.
+        Returns (error_lines, exe_path) — one is always None.
+        """
+        p_ident = project.get("identifier", "")
+        if not kde_builder_dirs:
+            return ["kde-builder is not configured.",
+                    "Run: ./please.sh kde-hijack <worktree>"], None
+        kd_src = kde_builder_dirs["source"] / p_ident
+        kd_bld = kde_builder_dirs["build"]  / p_ident
+        kd_log = kde_builder_dirs.get("log")
+
+        with _qt_ver_lock:
+            local = _kde_local_cache.get(p_ident)
+
+        if local is None:
+            schedule_kde_local_fetch(p_ident, kd_src, kd_bld, kd_log)
+            return ["Build status not yet loaded.",
+                    "Please try again in a moment."], None
+
+        if not local.get("bld_exists"):
+            return [f"⚠ '{p_ident}' has not been built.",
+                    "Use 'Build with kde-builder' first."], None
+
+        build_ok = local.get("installed") or local.get("build_success") is True
+        if not build_ok:
+            if local.get("build_success") is False:
+                return [f"⚠ Last build of '{p_ident}' failed.",
+                        "Fix build errors, then rebuild."], None
+            return [f"⚠ '{p_ident}' has not been successfully built.",
+                    "Use 'Build with kde-builder' first."], None
+
+        exe_candidates = [kd_bld / "bin" / p_ident, kd_bld / p_ident]
+        exe = next((c for c in exe_candidates if c.exists()), None)
+        if exe is None:
+            return [f"⚠ Executable not found for '{p_ident}'.",
+                    f"  Tried: {kd_bld}/bin/{p_ident}",
+                    f"         {kd_bld}/{p_ident}"], None
+
+        return None, str(exe)
+
+    def _do_workspace_add(project, worktree):
+        """Create symlinks + update .code-workspace + .clangd.  Returns (lines, is_error)."""
+        ident  = project.get("identifier", "")
+        kind   = project.get("kind", "")
+        branch = worktree["branch"]
+
+        if not kde_builder_dirs:
+            return ["kde-builder not configured.",
+                    "Run: ./please.sh kde-hijack <worktree>"], True
+
+        ws_path = _workspace_path(branch)
+        if not ws_path.exists():
+            return [f"Workspace not found: {ws_path.name}",
+                    f"Run: ./please.sh build {branch}"], True
+
+        src = kde_builder_dirs["source"] / ident
+        bld = kde_builder_dirs["build"]  / ident
+        apps_dir   = SCRIPT_DIR / f"{branch}-apps"
+        bapps_dir  = SCRIPT_DIR / f"{branch}-build" / "apps"
+        apps_link  = apps_dir  / ident
+        build_link = bapps_dir / ident
+        msgs = []
+
+        # Symlinks
+        apps_dir.mkdir(exist_ok=True)
+        bapps_dir.mkdir(parents=True, exist_ok=True)
+        for link, target, label in [
+            (apps_link,  src, f"{branch}-apps/{ident}"),
+            (build_link, bld, f"{branch}-build/apps/{ident}"),
+        ]:
+            if link.is_symlink():
+                msgs.append(f"symlink exists: {label}")
+            elif link.exists():
+                # A real directory is in the way (e.g. created by a previous
+                # please.sh app-run before this project was added via the browser).
+                # Replace it with the proper symlink.
+                import shutil
+                shutil.rmtree(str(link)) if link.is_dir() else link.unlink()
+                link.symlink_to(target)
+                msgs.append(f"replaced stale path with symlink: {label}")
+            else:
+                link.symlink_to(target)
+                msgs.append(f"linked: {label}")
+
+        # .clangd entry
+        clangd    = SCRIPT_DIR / ".clangd"
+        db_marker = f"{branch}-build/apps/{ident}"
+        existing  = clangd.read_text() if clangd.exists() else ""
+        if db_marker in existing:
+            msgs.append(".clangd: already present")
+        else:
+            entry = (
+                f"\n---\n"
+                f"# kde-project-browser: {branch}/{ident}\n"
+                f"If:\n"
+                f"  PathMatch: {branch}-apps/{ident}/.*\n"
+                f"CompileFlags:\n"
+                f"  CompilationDatabase: {db_marker}\n"
+            )
+            with open(clangd, "a") as f:
+                f.write(entry)
+            msgs.append(".clangd: added entry")
+
+        # .code-workspace JSON
+        try:
+            ws = json.loads(ws_path.read_text())
+        except Exception as e:
+            return [f"Failed to read workspace: {e}"], True
+
+        folder_path = f"{branch}-apps/{ident}"
+        folders = ws.get("folders", [])
+        if any(f.get("path") == folder_path for f in folders):
+            msgs.append("workspace: folder already present")
+        else:
+            folders.append({"name": f"KDE: {ident}", "path": folder_path})
+            ws["folders"] = folders
+            msgs.append("workspace: added folder")
+
+        # For runnable projects: add task + launch config
+        if kind in ("app", "tool", "software"):
+            exe_candidates = [bld / "bin" / ident, bld / ident]
+            exe = next((str(c) for c in exe_candidates if c.exists()),
+                       str(bld / "bin" / ident))
+            mi  = "lldb" if sys.platform == "darwin" else "gdb"
+            lbl = f"KDE: {ident}"
+
+            tasks = ws.setdefault("tasks", {"version": "2.0.0", "tasks": []})["tasks"]
+            if not any(t.get("label") == lbl for t in tasks):
+                tasks.append({
+                    "label": lbl, "type": "shell",
+                    "command": f"kde-builder {ident} && {exe}",
+                    "group": "build",
+                    "presentation": {"reveal": "always", "panel": "dedicated"},
+                })
+                msgs.append("workspace: added task")
+
+            confs = ws.setdefault("launch", {"version": "0.2.0", "configurations": []})["configurations"]
+            if not any(c.get("name") == lbl for c in confs):
+                confs.append({
+                    "name": lbl, "type": "cppdbg", "request": "launch",
+                    "program": exe, "args": [], "cwd": str(bld), "MIMode": mi,
+                    "sourceFileMap": {str(src): str(apps_link)},
+                    "setupCommands": [{"text": "-enable-pretty-printing",
+                                       "ignoreFailures": True}],
+                })
+                msgs.append("workspace: added launch config")
+
+        ws_path.write_text(json.dumps(ws, indent=4))
+        return [f"✓ Added '{ident}' to {branch}:"] + [f"  {m}" for m in msgs], False
+
+    def _do_workspace_remove(project, worktree):
+        """Undo _do_workspace_add.  Returns (lines, is_error)."""
+        ident  = project.get("identifier", "")
+        branch = worktree["branch"]
+
+        ws_path = _workspace_path(branch)
+        if not ws_path.exists():
+            return [f"Workspace not found: {ws_path.name}",
+                    f"Run: ./please.sh build {branch}"], True
+
+        msgs = []
+
+        # Remove symlinks
+        for link, label in [
+            (SCRIPT_DIR / f"{branch}-apps"         / ident, f"{branch}-apps/{ident}"),
+            (SCRIPT_DIR / f"{branch}-build" / "apps" / ident, f"{branch}-build/apps/{ident}"),
+        ]:
+            if link.is_symlink():
+                link.unlink()
+                msgs.append(f"removed: {label}")
+            else:
+                msgs.append(f"not a symlink (skipped): {label}")
+
+        # .clangd entry
+        clangd    = SCRIPT_DIR / ".clangd"
+        db_marker = f"{branch}-build/apps/{ident}"
+        if clangd.exists():
+            text = clangd.read_text()
+            if db_marker in text:
+                # Split on '---\n', drop the section containing our marker, rejoin
+                sections = text.split("---\n")
+                sections = [s for s in sections if db_marker not in s]
+                clangd.write_text("---\n".join(sections))
+                msgs.append(".clangd: removed entry")
+            else:
+                msgs.append(".clangd: entry not found")
+
+        # .code-workspace JSON
+        try:
+            ws = json.loads(ws_path.read_text())
+        except Exception as e:
+            return [f"Failed to read workspace: {e}"], True
+
+        folder_path = f"{branch}-apps/{ident}"
+        lbl         = f"KDE: {ident}"
+
+        before = len(ws.get("folders", []))
+        ws["folders"] = [f for f in ws.get("folders", []) if f.get("path") != folder_path]
+        if len(ws["folders"]) < before:
+            msgs.append("workspace: removed folder")
+
+        for section, key in [("tasks", "tasks"), ("launch", "configurations")]:
+            if section in ws and key in ws[section]:
+                before = len(ws[section][key])
+                ws[section][key] = [x for x in ws[section][key] if x.get("label") != lbl
+                                     and x.get("name") != lbl]
+                if len(ws[section][key]) < before:
+                    msgs.append(f"workspace: removed from {section}")
+
+        ws_path.write_text(json.dumps(ws, indent=4))
+        return [f"✓ Removed '{ident}' from {branch}:"] + [f"  {m}" for m in msgs], False
+
+    def _worktree_from_kde_builder():
+        """Deduce the active Qt worktree from qt-install-dir in kde-builder.yaml.
+        Returns (worktree_dict, None) on success, or (None, error_str) on failure.
+        """
+        if not kde_builder_dirs:
+            return None, "kde-builder not configured (no ~/.config/kde-builder.yaml)"
+        qt_install = kde_builder_dirs.get("qt_install")
+        if not qt_install:
+            return None, "qt-install-dir not set — run: ./please.sh kde-hijack <branch>"
+        build_dir = qt_install.parent          # e.g. <SCRIPT_DIR>/dev-build
+        if not build_dir.name.endswith("-build"):
+            return None, f"qt-install-dir not in a <branch>-build/qtbase structure: {qt_install}"
+        branch = build_dir.name[: -len("-build")]
+        wts    = worktree_info.get("worktrees", [])
+        wt     = next((w for w in wts if w["branch"] == branch), None)
+        if wt is None:
+            return None, f"No worktree found for branch '{branch}'"
+        return wt, None
+
+    def _dispatch_wt(project, wt):
+        """Run the command currently in pending_cmd against the given worktree.
+        Mutates panel/cmd_result_* state; returns an action dict if we must exit,
+        or None if we stay in the TUI.
+        """
+        nonlocal panel, cmd_result_lines, cmd_result_ok
+        if pending_cmd == 0:  # Change Qt version
+            return {"action": "kde-hijack", "worktree": wt["branch"]}
+        elif pending_cmd == 1:  # Fix Qt build
+            lines, act = _do_fix_qt_build(project, wt)
+            if act:
+                return act
+            cmd_result_lines = lines
+            cmd_result_ok    = True
+        elif pending_cmd == 3:  # Add to workspace
+            lines, is_err    = _do_workspace_add(project, wt)
+            cmd_result_lines = lines
+            cmd_result_ok    = not is_err
+        elif pending_cmd == 4:  # Remove from workspace
+            lines, is_err    = _do_workspace_remove(project, wt)
+            cmd_result_lines = lines
+            cmd_result_ok    = not is_err
+        panel = "cmd_result"
+        return None
+
+    while True:
+        h, w = stdscr.getmaxyx()
+        stdscr.erase()
+
+        LIST_W = min(42, w // 2)
+        DET_X  = LIST_W + 1
+        DET_W  = w - DET_X
+        LIST_H = h - 5
+
+        # ── title ────────────────────────────────────────────────────────
+        title = "  KDE Project Browser  "
+        stdscr.addstr(0, max(0, (w - len(title)) // 2), title, C_HEAD | curses.A_BOLD)
+
+        # ── search bar ───────────────────────────────────────────────────
+        lbl = " Search: "
+        stdscr.addstr(1, 0, lbl, C_HEAD | curses.A_BOLD)
+        field = (search + "_")[: w - len(lbl) - 18]
+        stdscr.addstr(1, len(lbl), field, C_SBAR)
+        count = f" {len(filtered)}/{len(projects)} "
+        try:
+            stdscr.addstr(1, w - len(count) - 1, count, C_HI)
+        except curses.error:
+            pass
+
+        # ── category tabs ─────────────────────────────────────────────────
+        x = 0
+        for i, cat in enumerate(categories):
+            lbl_c = f" {cat} "
+            if x + len(lbl_c) >= w - 1:
+                break
+            try:
+                stdscr.addstr(2, x, lbl_c, C_SEL if i == cat_idx else C_CAT)
+            except curses.error:
+                pass
+            x += len(lbl_c) + 1
+
+        # ── top divider ───────────────────────────────────────────────────
+        try:
+            stdscr.addstr(3, 0, "─" * w, C_HEAD)
+        except curses.error:
+            pass
+
+        # ── clamp selection / scroll ──────────────────────────────────────
+        if filtered:
+            selected = max(0, min(selected, len(filtered) - 1))
+        if selected < scroll:
+            scroll = selected
+        elif selected >= scroll + LIST_H:
+            scroll = selected - LIST_H + 1
+
+        # ── project list ──────────────────────────────────────────────────
+        for i in range(LIST_H):
+            idx = i + scroll
+            if idx >= len(filtered):
+                break
+            p      = filtered[idx]
+            ident  = p.get("identifier", "")
+            cat    = p.get("_category",  "")
+            y      = i + 4
+            is_sel = idx == selected
+
+            if is_sel:
+                try:
+                    stdscr.addstr(y, 0, f" {ident}".ljust(LIST_W)[:LIST_W], C_SEL)
+                except curses.error:
+                    pass
+            else:
+                row = f" {ident}"
+                try:
+                    stdscr.addstr(y, 0, row[:LIST_W], C_NORM)
+                except curses.error:
+                    pass
+                cat_str = cat[:10]
+                cx = LIST_W - len(cat_str) - 1
+                if cx > len(row):
+                    try:
+                        stdscr.addstr(y, cx, cat_str, C_CAT)
+                    except curses.error:
+                        pass
+
+        # scrollbar
+        if len(filtered) > LIST_H:
+            bar_h = max(1, LIST_H * LIST_H // len(filtered))
+            bar_y = 4 + (scroll * (LIST_H - bar_h)) // max(1, len(filtered) - LIST_H)
+            for yy in range(4, 4 + LIST_H):
+                ch = "█" if bar_y <= yy < bar_y + bar_h else "░"
+                try:
+                    stdscr.addstr(yy, LIST_W - 1, ch, C_HEAD)
+                except curses.error:
+                    pass
+
+        # ── vertical divider ──────────────────────────────────────────────
+        for yy in range(3, h - 1):
+            try:
+                stdscr.addstr(yy, LIST_W, "│", C_HEAD)
+            except curses.error:
+                pass
+
+        # ── detail panel ─────────────────────────────────────────────────
+        if filtered and DET_W > 12 and panel == "list":
+            p    = filtered[selected]
+            dy   = 4
+            dmax = h - 2
+
+            def sep():
+                nonlocal dy
+                if dy < dmax:
+                    try:
+                        stdscr.addstr(dy, DET_X, " " + "─" * (DET_W - 2), C_HEAD)
+                    except curses.error:
+                        pass
+                    dy += 1
+
+            def det(lbl, val, color=C_NORM):
+                nonlocal dy
+                if dy >= dmax or not val:
+                    return
+                lbl_s = f" {lbl}: "
+                val_s = str(val)[: DET_W - len(lbl_s) - 1]
+                try:
+                    stdscr.addstr(dy, DET_X, lbl_s, C_HEAD | curses.A_BOLD)
+                    stdscr.addstr(dy, DET_X + len(lbl_s), val_s, color)
+                except curses.error:
+                    pass
+                dy += 1
+
+            def wrap_text(text: str, color=C_NORM, indent=1):
+                """Render word-wrapped text in the detail panel."""
+                nonlocal dy
+                avail = DET_W - indent - 1
+                words = text.split()
+                buf: list[str] = []
+                for word in words:
+                    if dy >= dmax:
+                        return
+                    if buf and len(" ".join(buf + [word])) > avail:
+                        try:
+                            stdscr.addstr(dy, DET_X + indent, " ".join(buf), color)
+                        except curses.error:
+                            pass
+                        dy += 1
+                        buf = [word]
+                    else:
+                        buf.append(word)
+                if buf and dy < dmax:
+                    try:
+                        stdscr.addstr(dy, DET_X + indent, " ".join(buf), color)
+                    except curses.error:
+                        pass
+                    dy += 1
+
+            def dep_list(lbl: str, repopaths: list[str], color=C_NORM, max_show=16):
+                """Render a labelled, wrapped comma-separated list of deps."""
+                nonlocal dy
+                if dy >= dmax:
+                    return
+                total = len(repopaths)
+                header = f" {lbl} ({total}):"
+                try:
+                    stdscr.addstr(dy, DET_X, header, C_HEAD | curses.A_BOLD)
+                except curses.error:
+                    pass
+                dy += 1
+                if dy >= dmax:
+                    return
+
+                shown = repopaths[:max_show]
+                names = [repopath_to_ident.get(r, r.split("/")[-1]) for r in shown]
+                overflow = total - max_show
+                if overflow > 0:
+                    names.append(f"+{overflow} more")
+
+                # wrap as comma-separated items
+                avail = DET_W - 3
+                buf: list[str] = []
+                for i, name in enumerate(names):
+                    item = name + ("," if i < len(names) - 1 else "")
+                    test = " ".join(buf + [item]) if buf else item
+                    if buf and len(test) > avail:
+                        try:
+                            stdscr.addstr(dy, DET_X + 2, " ".join(buf), color)
+                        except curses.error:
+                            pass
+                        dy += 1
+                        if dy >= dmax:
+                            return
+                        buf = [item]
+                    else:
+                        buf.append(item)
+                if buf and dy < dmax:
+                    try:
+                        stdscr.addstr(dy, DET_X + 2, " ".join(buf), color)
+                    except curses.error:
+                        pass
+                    dy += 1
+
+            # ── name header ───────────────────────────────────────────────
+            name = p.get("name", p.get("identifier", ""))
+            try:
+                stdscr.addstr(dy, DET_X, f" {name}"[:DET_W], C_HI | curses.A_BOLD)
+            except curses.error:
+                pass
+            dy += 1
+            sep()
+
+            # ── metadata fields ───────────────────────────────────────────
+            ident = p.get("identifier", "")
+            rp    = p.get("repopath",   "")
+            life  = p.get("lifecycle",  "")
+            det("Identifier", ident, C_HI)
+            det("Repo path",  rp,    C_HI)
+            det("Category",   p.get("_category",   ""), C_CAT)
+            det("Lifecycle",  life, LIFECYCLE_COLOR.get(life, C_NORM))
+            det("Kind",       p.get("kind",         ""))
+
+            # ── active Qt worktree (from kde-builder qt-install-dir) ──────
+            _qt_install = kde_builder_dirs.get("qt_install") if kde_builder_dirs else None
+            _wt_branch  = None
+            if _qt_install:
+                _bd = _qt_install.parent
+                if _bd.name.endswith("-build"):
+                    _wt_branch = _bd.name[: -len("-build")]
+            _wts = worktree_info.get("worktrees", [])
+            _wt_match = next((w for w in _wts if w["branch"] == _wt_branch), None) \
+                        if _wt_branch else None
+            if _wt_match:
+                _qmake_ok = (_qt_install / "bin" / "qmake").exists()
+                _wt_label = f"{_wt_branch} ✓" if _qmake_ok else f"{_wt_branch} (build broken)"
+                _wt_color = curses.color_pair(2) if _qmake_ok else curses.color_pair(7)
+                det("Qt worktree", _wt_label, _wt_color)
+            else:
+                det("Qt worktree", "Use 'Change Qt version' first.", C_HI)
+
+            # Min Qt version — fetched async from invent.kde.org
+            if rp:
+                schedule_qt_ver_fetch(ident, rp)
+            with _qt_ver_lock:
+                qt_min_ver  = _qt_ver_cache.get(ident, _SENTINEL)
+                is_fetching = ident in _qt_ver_fetching
+                cmake_pkgs  = _qt_cmake_deps_cache.get(ident)
+                cached_ver  = qt_min_ver
+            if qt_min_ver is _SENTINEL:
+                if is_fetching:
+                    det("Min Qt", "…", C_NORM)
+            elif qt_min_ver is None:
+                det("Min Qt", "unknown", C_NORM)
+            else:
+                det("Min Qt", qt_min_ver, C_HI)
+
+            # ── kde-builder local state ───────────────────────────────────
+            if kde_builder_dirs:
+                kd_src = kde_builder_dirs["source"] / ident
+                kd_bld = kde_builder_dirs["build"]  / ident
+                kd_log = kde_builder_dirs.get("log")
+                schedule_kde_local_fetch(ident, kd_src, kd_bld, kd_log)
+                with _qt_ver_lock:
+                    local        = _kde_local_cache.get(ident)
+                    local_loading = ident in _kde_local_fetching
+
+                if local_loading and local is None:
+                    det("Source", "…", C_NORM)
+                    det("Build",  "…", C_NORM)
+                elif local is not None:
+                    # Source
+                    if not local.get("src_exists"):
+                        det("Source", "not cloned", C_NORM)
+                    else:
+                        branch  = local.get("branch", "?")
+                        summary = local.get("git_summary", "?")
+                        s_color = curses.color_pair(2) if local.get("git_clean") else C_HI
+                        det("Source", f"{branch} · {summary}", s_color)
+
+                    # Build
+                    if not local.get("bld_exists"):
+                        det("Build", "not built", C_NORM)
+                    else:
+                        success  = local.get("build_success")
+                        installed = local.get("installed", False)
+                        conf_at  = local.get("configured_at", "")
+                        if installed:
+                            b_str   = f"✓ installed ({conf_at})" if conf_at else "✓ installed"
+                            b_color = curses.color_pair(2)
+                        elif success is True:
+                            b_str   = f"✓ built ({conf_at})" if conf_at else "✓ built"
+                            b_color = curses.color_pair(2)
+                        elif success is False:
+                            b_str   = f"✗ build failed ({conf_at})" if conf_at else "✗ build failed"
+                            b_color = curses.color_pair(7)
+                        elif local.get("configured"):
+                            b_str   = f"configured ({conf_at})" if conf_at else "configured"
+                            b_color = C_HI
+                        else:
+                            b_str   = "build dir exists (not configured)"
+                            b_color = C_NORM
+                        det("Build", b_str, b_color)
+
+            # ── workspace membership ──────────────────────────────────────
+            _in_ws = [
+                wt["branch"]
+                for wt in worktree_info.get("worktrees", [])
+                if (SCRIPT_DIR / f"{wt['branch']}-apps" / ident).is_symlink()
+            ]
+            if _in_ws:
+                det("In workspaces", ", ".join(_in_ws), curses.color_pair(2))
+
+            # ── description ───────────────────────────────────────────────
+            desc = p.get("description", "")
+            if desc and dy + 1 < dmax:
+                dy += 1
+                wrap_text(desc, C_NORM)
+
+            # ── dependencies ──────────────────────────────────────────────
+            fwd = forward_deps.get(rp, [])
+            rev = reverse_deps.get(rp, [])
+
+            if fwd or rev:
+                if dy + 1 < dmax:
+                    dy += 1
+                sep()
+
+            if fwd:
+                # Collect full transitive KDE dep set via BFS
+                fwd_set: set[str] = set(fwd)
+                all_kde: set[str] = set()
+                queue = list(fwd)
+                visited_kde = {rp}
+                while queue:
+                    dep_rp = queue.pop()
+                    if dep_rp in visited_kde:
+                        continue
+                    visited_kde.add(dep_rp)
+                    all_kde.add(dep_rp)
+                    queue.extend(forward_deps.get(dep_rp, []))
+                all_kde_sorted = sorted(
+                    all_kde,
+                    key=lambda r: repopath_to_ident.get(r, r.split("/")[-1]),
+                )
+
+                # Render with direct deps highlighted in yellow, transitive in normal
+                if dy < dmax:
+                    try:
+                        stdscr.addstr(
+                            dy, DET_X,
+                            f" Depends on ({len(all_kde)}):",
+                            C_HEAD | curses.A_BOLD,
+                        )
+                    except curses.error:
+                        pass
+                    dy += 1
+                avail = DET_W - 3
+                x = 0
+                for i, dep_rp in enumerate(all_kde_sorted):
+                    if dy >= dmax:
+                        break
+                    name    = repopath_to_ident.get(dep_rp, dep_rp.split("/")[-1])
+                    is_last = i == len(all_kde_sorted) - 1
+                    text    = name if is_last else name + ","
+                    color   = C_HI if dep_rp in fwd_set else C_NORM
+                    if x > 0 and x + len(text) > avail:
+                        dy += 1
+                        x = 0
+                        if dy >= dmax:
+                            break
+                    try:
+                        stdscr.addstr(dy, DET_X + 2 + x, text, color)
+                    except curses.error:
+                        pass
+                    x += len(text) + 1
+                if x > 0:
+                    dy += 1
+
+            if rev:
+                if fwd and dy < dmax:
+                    dy += 1
+                rev_sorted = sorted(rev, key=lambda r: repopath_to_ident.get(r, r))
+                dep_list("Required by", rev_sorted, C_CAT, max_show=12)
+
+            # Compute full transitive Qt module set.
+            # cmake is authoritative for this project when available; arch.yaml
+            # is the fast-loading placeholder shown until the fetch completes.
+            if cmake_pkgs is not None:
+                effective_qt_deps = {**qt_deps, ident: sorted(cmake_pkgs | {"qt6-base"})}
+            else:
+                effective_qt_deps = qt_deps
+            all_qt_mods = collect_qt_deps_transitive(
+                ident, effective_qt_deps, forward_deps, repopath_to_ident, ident_to_repopath
+            )
+
+            if all_qt_mods:
+                if dy + 1 < dmax:
+                    dy += 1
+                sep()
+                short = sorted(arch_pkg_to_submodule(m) for m in all_qt_mods)
+                dep_list("Qt modules", short, C_HI, max_show=len(short))
+
+            # ── worktree coverage ─────────────────────────────────────────
+            worktrees = worktree_info.get("worktrees", [])
+            known_mods = worktree_info.get("known", set())
+
+            # Normalise min-version to (major, minor) for branch comparisons
+            if cached_ver is not _SENTINEL and cached_ver is not None:
+                min_ver_parts = tuple(
+                    int(x) for x in str(cached_ver).split(".")
+                )[:2]
+            else:
+                min_ver_parts = None
+
+            if worktrees and (all_qt_mods or min_ver_parts):
+                required = (
+                    {arch_pkg_to_submodule(m) for m in all_qt_mods} & known_mods
+                    if all_qt_mods and known_mods else set()
+                )
+                if dy + 1 < dmax:
+                    dy += 1
+                sep()
+                if dy < dmax:
+                    try:
+                        stdscr.addstr(dy, DET_X, " Worktree coverage:", C_HEAD | curses.A_BOLD)
+                    except curses.error:
+                        pass
+                    dy += 1
+                for wt in worktrees:
+                    if dy >= dmax:
+                        break
+                    branch  = wt["branch"]
+                    missing = sorted(required - wt["modules"])
+
+                    # Check if the branch's Qt version is too old
+                    ver_too_old = False
+                    if min_ver_parts:
+                        bv = parse_branch_version(branch)
+                        if bv is not None and bv[:2] < min_ver_parts:
+                            ver_too_old = True
+
+                    if ver_too_old:
+                        bv_str = ".".join(str(x) for x in bv)
+                        mv_str = ".".join(str(x) for x in min_ver_parts)
+                        line = f"  {branch}: Qt {bv_str} < {mv_str} required"
+                        try:
+                            stdscr.addstr(dy, DET_X, line[:DET_W - 1], curses.color_pair(7))
+                        except curses.error:
+                            pass
+                        dy += 1
+                    elif not missing:
+                        line = f"  {branch}: ✓ all Qt deps present"
+                        try:
+                            stdscr.addstr(dy, DET_X, line[:DET_W - 1], curses.color_pair(2))
+                        except curses.error:
+                            pass
+                        dy += 1
+                    else:
+                        line = f"  {branch}: missing {', '.join(missing)}"
+                        try:
+                            stdscr.addstr(dy, DET_X, line[:DET_W - 1], C_HI)
+                        except curses.error:
+                            pass
+                        dy += 1
+                        if dy < dmax:
+                            cmd = f"./please.sh create {branch} {','.join(missing)}"
+                            try:
+                                stdscr.addstr(dy, DET_X + 2, f"→ {cmd}"[:DET_W - 3], C_CAT)
+                            except curses.error:
+                                pass
+                            dy += 1
+
+        # ── command panel ─────────────────────────────────────────────────
+        elif filtered and DET_W > 12:
+            p      = filtered[selected]
+            p_name = p.get("name", p.get("identifier", ""))
+            cy     = 4
+            cmax   = h - 2
+
+            def cline(text, color=C_NORM, off=1):
+                nonlocal cy
+                if cy >= cmax:
+                    return
+                try:
+                    stdscr.addstr(cy, DET_X + off, str(text)[: DET_W - off - 1], color)
+                except curses.error:
+                    pass
+                cy += 1
+
+            def csep():
+                nonlocal cy
+                if cy < cmax:
+                    try:
+                        stdscr.addstr(cy, DET_X, " " + "─" * (DET_W - 2), C_HEAD)
+                    except curses.error:
+                        pass
+                    cy += 1
+
+            if panel == "commands":
+                cline(f"Commands — {p_name}", C_HI | curses.A_BOLD)
+                csep()
+                for i, (cmd_name, _) in enumerate(COMMANDS):
+                    attr = C_SEL if i == cmd_idx else C_NORM
+                    pfx  = "▶ " if i == cmd_idx else "  "
+                    cline(f"{pfx}{cmd_name}", attr)
+                csep()
+                _, desc = COMMANDS[cmd_idx]
+                cline(desc)
+                cy += 1
+                cline("→/Enter:run   ←:back   ↑↓:navigate", C_CAT)
+
+            elif panel == "wt_select":
+                cline(f"{COMMANDS[pending_cmd][0]} — {p_name}", C_HI | curses.A_BOLD)
+                csep()
+                wts = worktree_info.get("worktrees", [])
+                if wts:
+                    cline("Select worktree:", C_HEAD | curses.A_BOLD)
+                    for i, wt in enumerate(wts):
+                        attr = C_SEL if i == wt_idx else C_NORM
+                        pfx  = "▶ " if i == wt_idx else "  "
+                        cline(f"{pfx}{wt['branch']}", attr)
+                else:
+                    cline("No Qt worktrees found.", curses.color_pair(7))
+                    cline("Run: ./please.sh create <branch>")
+                csep()
+                cline("Enter:confirm   ←:cancel   ↑↓:navigate", C_CAT)
+
+            elif panel == "run_mode_select":
+                cline(f"Run application — {p_name}", C_HI | curses.A_BOLD)
+                csep()
+                cline("How to run:", C_HEAD | curses.A_BOLD)
+                for i, opt in enumerate(run_mode_options):
+                    attr = C_SEL if i == run_mode_idx else C_NORM
+                    pfx  = "▶ " if i == run_mode_idx else "  "
+                    cline(f"{pfx}{opt}", attr)
+                csep()
+                cline("Enter:run   ←:cancel   ↑↓:navigate", C_CAT)
+
+            elif panel == "cmd_result":
+                cline("Result", C_HI | curses.A_BOLD)
+                csep()
+                r_color = curses.color_pair(2) if cmd_result_ok else curses.color_pair(7)
+                for line in cmd_result_lines:
+                    cline(line, r_color)
+                cy += 1
+                cline("Enter/←:back", C_CAT)
+
+        # ── footer ────────────────────────────────────────────────────────
+        fy = h - 1
+        try:
+            stdscr.addstr(fy, 0, HELP[: w - 1], C_HEAD)
+        except curses.error:
+            pass
+        if status_msg:
+            try:
+                stdscr.addstr(fy, w - len(status_msg) - 2, status_msg, C_HI)
+            except curses.error:
+                pass
+            status_msg = ""
+
+        stdscr.refresh()
+
+        # ── input ─────────────────────────────────────────────────────────
+        key = stdscr.getch()
+
+        if key == -1:
+            continue
+
+        # RIGHT → enter command panel
+        if key == curses.KEY_RIGHT and panel == "list" and filtered:
+            panel   = "commands"
+            cmd_idx = 0
+
+        # LEFT → navigate back
+        elif key == curses.KEY_LEFT and panel != "list":
+            if panel == "commands":
+                panel = "list"
+            else:
+                panel            = "commands"
+                cmd_result_lines = []
+
+        # ── command panel ─────────────────────────────────────────────────
+        elif panel == "commands":
+            if key == curses.KEY_UP:
+                cmd_idx = max(0, cmd_idx - 1)
+            elif key == curses.KEY_DOWN:
+                cmd_idx = min(len(COMMANDS) - 1, cmd_idx + 1)
+            elif key in (ord("\n"), curses.KEY_ENTER) and filtered:
+                wts = worktree_info.get("worktrees", [])
+                if cmd_idx == 0:  # Change Qt version — show worktree picker
+                    if not wts:
+                        cmd_result_lines = ["No Qt worktrees found.",
+                                            "Run: ./please.sh create <branch>"]
+                        cmd_result_ok    = False
+                        panel            = "cmd_result"
+                    elif len(wts) == 1:
+                        pending_cmd = 0
+                        act = _dispatch_wt(filtered[selected], wts[0])
+                        if act:
+                            return act
+                    else:
+                        pending_cmd = 0
+                        wt_idx      = 0
+                        panel       = "wt_select"
+                elif cmd_idx == 2:  # Build with kde-builder — no worktree needed
+                    lines, act = _do_kde_builder(filtered[selected])
+                    if act:
+                        return act
+                    cmd_result_lines = lines
+                    cmd_result_ok    = False
+                    panel            = "cmd_result"
+                elif cmd_idx == 5:  # Run application — validate then pick run mode
+                    err_lines, exe = _find_exe(filtered[selected])
+                    if err_lines:
+                        cmd_result_lines = err_lines
+                        cmd_result_ok    = False
+                        panel            = "cmd_result"
+                    else:
+                        pending_exe      = exe
+                        run_mode_options = ["Run directly"] + find_wayland_sessions()
+                        run_mode_idx     = 0
+                        panel            = "run_mode_select"
+                elif cmd_idx in (1, 3, 4):  # Deduce worktree from qt-install-dir
+                    wt, err = _worktree_from_kde_builder()
+                    if err:
+                        cmd_result_lines = ["Cannot determine active worktree:",
+                                            f"  {err}",
+                                            "Use 'Change Qt version' first."]
+                        cmd_result_ok    = False
+                        panel            = "cmd_result"
+                    else:
+                        pending_cmd = cmd_idx
+                        act = _dispatch_wt(filtered[selected], wt)
+                        if act:
+                            return act
+            elif key == 27:
+                panel = "list"
+
+        # ── worktree select ───────────────────────────────────────────────
+        elif panel == "wt_select":
+            wts = worktree_info.get("worktrees", [])
+            if key == curses.KEY_UP:
+                wt_idx = max(0, wt_idx - 1)
+            elif key == curses.KEY_DOWN:
+                wt_idx = min(len(wts) - 1, wt_idx + 1)
+            elif key in (ord("\n"), curses.KEY_ENTER):
+                if wts and 0 <= wt_idx < len(wts) and filtered:
+                    act = _dispatch_wt(filtered[selected], wts[wt_idx])
+                    if act:
+                        return act
+            elif key == 27:
+                panel            = "commands"
+                cmd_result_lines = []
+
+        # ── run mode select ───────────────────────────────────────────────
+        elif panel == "run_mode_select":
+            if key == curses.KEY_UP:
+                run_mode_idx = max(0, run_mode_idx - 1)
+            elif key == curses.KEY_DOWN:
+                run_mode_idx = min(len(run_mode_options) - 1, run_mode_idx + 1)
+            elif key in (ord("\n"), curses.KEY_ENTER) and run_mode_options:
+                opt = run_mode_options[run_mode_idx]
+                if opt == "Run directly":
+                    return {"action": "run-directly", "exe": pending_exe}
+                else:
+                    return {"action": "run-wayland", "exe": pending_exe, "display": opt}
+            elif key == 27:
+                panel = "commands"
+
+        # ── result panel ──────────────────────────────────────────────────
+        elif panel == "cmd_result":
+            if key in (ord("\n"), curses.KEY_ENTER, 27):
+                panel            = "commands"
+                cmd_result_lines = []
+
+        # ── list panel ────────────────────────────────────────────────────
+        elif key in (ord("\n"), curses.KEY_ENTER):
+            break
+        elif key == 27:
+            return None
+        elif key in (curses.KEY_BACKSPACE, 127, 8):
+            if search:
+                search = search[:-1]
+                refilter()
+        elif key == ord("\t"):
+            cat_idx = (cat_idx + 1) % len(categories)
+            refilter()
+        elif key == curses.KEY_BTAB:
+            cat_idx = (cat_idx - 1) % len(categories)
+            refilter()
+        elif key == curses.KEY_UP:
+            selected = max(0, selected - 1)
+        elif key == curses.KEY_DOWN:
+            selected = min(len(filtered) - 1, selected + 1) if filtered else 0
+        elif key == curses.KEY_PPAGE:
+            selected = max(0, selected - LIST_H)
+            scroll   = max(0, scroll   - LIST_H)
+        elif key == curses.KEY_NPAGE:
+            selected = min(len(filtered) - 1, selected + LIST_H) if filtered else 0
+        elif key == curses.KEY_HOME:
+            selected = 0
+            scroll   = 0
+        elif key == curses.KEY_END:
+            selected = len(filtered) - 1 if filtered else 0
+        elif 32 <= key <= 126:
+            search += chr(key)
+            refilter()
+
+    return filtered[selected] if filtered else None
+
+
+# ── entry point ───────────────────────────────────────────────────────────────
+
+def main():
+    metadata_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else METADATA_DIR
+
+    if not metadata_dir.exists():
+        print(f"Error: metadata directory not found:\n  {metadata_dir}", file=sys.stderr)
+        print("Run 'kde-builder --metadata-only' to fetch it.", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Loading projects ...", end="", flush=True)
+    projects = load_projects(metadata_dir)
+    print(f" {len(projects)} active.", end="  ", flush=True)
+
+    if not projects:
+        print("No active projects found.", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Loading dependencies ...", end="", flush=True)
+    forward_deps, reverse_deps = load_dependencies(DEP_FILE)
+    print(f" {sum(len(v) for v in forward_deps.values())} edges.")
+
+    print(f"Loading Qt module deps ...", end="", flush=True)
+    qt_deps = load_qt_deps(ARCH_DEP_FILE)
+    print(f" {len(qt_deps)} projects with specific Qt modules.")
+
+    print(f"Loading worktrees ...", end="", flush=True)
+    worktree_info = load_worktrees(QT6_DIR)
+    wt_count = len(worktree_info["worktrees"])
+    if wt_count:
+        print(f" {wt_count} worktree(s): {', '.join(w['branch'] for w in worktree_info['worktrees'])}")
+    else:
+        print(" none found.")
+
+    kde_builder_dirs = load_kde_builder_dirs()
+    if kde_builder_dirs:
+        print(f"kde-builder: src={kde_builder_dirs['source']}  build={kde_builder_dirs['build']}")
+    else:
+        print("kde-builder: config not found, local state unavailable.")
+
+    repopath_to_ident = {p["repopath"]: p["identifier"] for p in projects if "repopath" in p}
+    ident_to_repopath = {v: k for k, v in repopath_to_ident.items()}
+
+    result = curses.wrapper(
+        lambda s: run(s, projects, forward_deps, reverse_deps,
+                      repopath_to_ident, ident_to_repopath, qt_deps,
+                      worktree_info, kde_builder_dirs)
+    )
+
+    if result is None:
+        sys.exit(1)
+
+    action = result.get("action") if isinstance(result, dict) else None
+
+    if action == "please-create":
+        worktree = result["worktree"]
+        modules  = ",".join(result["modules"])
+        please   = str(SCRIPT_DIR / "please.sh")
+        print(f"Running: {please} create {worktree} {modules}")
+        os.execvp(please, [please, "create", worktree, modules])
+
+    elif action == "please-build":
+        worktree = result["worktree"]
+        reserve  = str(result["reserve"])
+        please   = str(SCRIPT_DIR / "please.sh")
+        print(f"Running: {please} build {worktree} {reserve} --reconfigure")
+        os.execvp(please, [please, "build", worktree, reserve, "--reconfigure"])
+
+    elif action == "kde-hijack":
+        worktree = result["worktree"]
+        please   = str(SCRIPT_DIR / "please.sh")
+        print(f"Running: {please} kde-hijack {worktree}")
+        os.execvp(please, [please, "kde-hijack", worktree])
+
+    elif action == "kde-builder":
+        ident = result["identifier"]
+        print(f"Running: kde-builder {ident}")
+        try:
+            rc = subprocess.run(["kde-builder", ident]).returncode
+        except FileNotFoundError:
+            print("kde-builder not found on PATH.", file=sys.stderr)
+            sys.exit(127)
+        if rc == 0:
+            _, _, msg = regen_kde_clangd(kde_builder_dirs)
+            print(f".clangd: {msg}")
+        sys.exit(rc)
+
+    elif action == "run-directly":
+        exe = result["exe"]
+        print(f"Running: {exe}")
+        os.execvp(exe, [exe])
+
+    elif action == "run-wayland":
+        exe     = result["exe"]
+        display = result["display"]
+        env     = {**os.environ, "WAYLAND_DISPLAY": display}
+        print(f"Running: WAYLAND_DISPLAY={display} {exe}")
+        os.execvpe(exe, [exe], env)
+
+    else:
+        # Normal project selection — print identifier for shell capture
+        print(result.get("identifier", ""))
+
+
+if __name__ == "__main__":
+    main()
