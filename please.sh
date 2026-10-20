@@ -11,11 +11,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 QT6_DIR="$SCRIPT_DIR/qt6"
 DEFAULT_BRANCH="dev"
 DEFAULT_MODULES=(qtbase qtshadertools qtdeclarative)
-if [ "$(uname -s)" = "Darwin" ]; then
-    QTCREATOR_DIR="$HOME/Library/Application Support/QtProject/QtCreator"
-else
-    QTCREATOR_DIR="$HOME/.config/QtProject/qtcreator"
-fi
+# Qt Creator keeps its settings in INI format, which QSettings puts under
+# $XDG_CONFIG_HOME (default ~/.config) on macOS as well as Linux.
+QTCREATOR_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/QtProject/qtcreator"
 QTCREATOR_XML="$QTCREATOR_DIR/qtversion.xml"
 
 usage() {
