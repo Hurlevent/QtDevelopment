@@ -23,7 +23,7 @@ Usage: $0 <command> [args]
 Commands:
   help                        Show full help and dependency information
   create  [--lts] [branch] [modules]  Add a git worktree for [branch], initialize submodules, and update .clangd
-  build   [branch] [reserve] [--reconfigure] [--creator] [-- cmake-args...]  Configure and build; [reserve] idle CPU cores (default: 0)
+  build   [branch] [reserve] [--reconfigure] [--creator] [-- configure-args...]  Configure and build; [reserve] idle CPU cores (default: 0)
   destroy [branch]            Remove the worktree, build dir, and .code-workspace for [branch]
   update  [--sync] [--lts] [branch]  Fetch and rebase all initialized submodules onto [branch]; with --sync also runs QtSynchronizeRepo.cmake
   app-add    [branch] <path>  Build an external app against the Qt build for [branch] and register it in the workspace
@@ -72,14 +72,16 @@ WORKFLOW
        Gerrit) to the supermodule and every submodule, and checks out the LTS
        branch tqtc/lts-<branch> where one exists. 
 
-  2. ./please.sh build <branch> [reserve] [--reconfigure] [--creator] [-- cmake-args...]
+  2. ./please.sh build <branch> [reserve] [--reconfigure] [--creator] [-- configure-args...]
        Configures and builds each initialized module in dependency order
        (configure → ninja, one module at a time). Also regenerates the
        .code-workspace and .clangd files. The optional [reserve] argument keeps
        that many CPU cores idle: ninja is invoked with -j (nproc - reserve),
        with a minimum of 1. -developer-build is always passed to configure;
-       any arguments after -- are forwarded alongside it, e.g.:
-         ./please.sh build dev 2 -- -DQT_BUILD_EXAMPLES=ON
+       any arguments after -- are forwarded alongside it. configure itself
+       treats -DNAME=VALUE as a C++ define, so CMake variables go after a
+       second --, which configure passes on to CMake, e.g.:
+         ./please.sh build dev 2 -- -nomake tests -- -DQT_BUILD_EXAMPLES=ON
        --reconfigure deletes each module's CMakeCache.txt before configuring,
        forcing CMake to re-detect all features (e.g. after adding a new module).
        Existing compiled objects are preserved so only affected targets rebuild.

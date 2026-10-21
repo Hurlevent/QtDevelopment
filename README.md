@@ -23,7 +23,7 @@ If you leave out the branch, it defaults to `dev`. Run `./please.sh help` to see
 | Command | Description |
 |---|---|
 | `create [--lts] [branch] [modules]` | Add a worktree for `branch` and initialize submodules (default: `qtbase,qtshadertools,qtdeclarative`). Required dependencies are added automatically. `--lts` uses the commercial `tqtc/lts-<branch>` branches. |
-| `build [branch] [reserve] [--reconfigure] [--creator] [-- cmake-args...]` | Configure and build with `-developer-build`. `reserve` leaves that many CPU cores idle. `--creator` also sets up a Qt Creator session, kit and Qt version. |
+| `build [branch] [reserve] [--reconfigure] [--creator] [-- configure-args...]` | Configure and build with `-developer-build`; arguments after `--` go to `configure` (CMake variables after a second `--`). `reserve` leaves that many CPU cores idle. `--creator` also sets up a Qt Creator session, kit and Qt version. |
 | `update [--sync] [--lts] [branch]` | Fetch and rebase all initialized submodules. `--sync` also runs `QtSynchronizeRepo.cmake`. |
 | `destroy [branch]` | Remove the worktree, the build directory and the workspace file. |
 | `app-add [branch] <path>` | Build an external CMake app against the branch's Qt and register it as a VS Code task and launch config. |
