@@ -44,6 +44,18 @@ After a build, every `tst_*` auto test and every example executable is added to 
 
 Qt Creator users can use the --creator option with the build command in order to generate a session for a specific branch, in addition to other files that are necessary in order to enable clangd support out of the box for all the submodules initialized in the worktree.
 
+### Windows
+
+`please.bat` / `please.ps1` provide `create`, `build`, `update`, `destroy`, `help` and the `app-*` commands on Windows, with the same arguments and directory layout:
+
+```bat
+please create dev
+please build dev
+please app-add dev C:\path\to\app
+```
+
+They need only what comes with Windows 11 (Windows PowerShell 5.1). Each command checks for git, CMake, Ninja and MSVC, and lists anything missing with how to install it. MSVC is set up by finding `vcvarsall.bat` and loading its environment, so no Developer Command Prompt is needed. An existing build keeps the compiler it was configured with. Set `PLEASE_VS` (e.g. `2022`) to choose a Visual Studio installation. `please help` has the details. `--creator` and the Linux-only commands are not available on Windows.
+
 ### Directory layout
 
 ```
